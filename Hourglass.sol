@@ -1,8 +1,17 @@
-pragma solidity 0.5.8;
+pragma solidity ^0.5.0;
 
-import "./SafeMath.sol";
+/*
+:'######::'########:'########::'#######::
+'##... ##: ##.....::... ##..::'##.... ##:
+ ##:::..:: ##:::::::::: ##:::: ##:::: ##:
+ ##::::::: ######:::::: ##:::: ##:::: ##:
+ ##::::::: ##...::::::: ##:::: ##:::: ##:
+ ##::: ##: ##:::::::::: ##:::: ##:::: ##:
+. ######:: ########:::: ##::::. #######::
+:......:::........:::::..::::::.......:::
 
-// Creator: 773d62b24a9d49e1f990b22e3ef1a9903f44ee809a12d73e660c66c1772c47dd
+Creator: 773d62b24a9d49e1f990b22e3ef1a9903f44ee809a12d73e660c66c1772c47dd
+*/
 
 contract Hourglass {
     /*=================================
@@ -11,12 +20,6 @@ contract Hourglass {
     // only people with tokens
     modifier onlyBagholders() {
         require(myTokens() > 0);
-        _;
-    }
-
-    // only people with profits
-    modifier onlyStronghands() {
-        require(myDividends(true) > 0);
         _;
     }
 
@@ -97,6 +100,24 @@ contract Hourglass {
     // TRC20
     event Transfer(address indexed from, address indexed to, uint256 tokens);
 
+    event Approval(
+        address indexed owner,
+        address indexed spender,
+        uint256 value
+    );
+
+    // When a customer sets up AutoReinvestment
+    event onAutoReinvestmentEntry(
+        address indexed customerAddress,
+        uint256 nextExecutionTime,
+        uint256 rewardPerInvocation,
+        uint24 period,
+        uint256 minimumDividendValue
+    );
+
+    // When a customer stops AutoReinvestment
+    event onAutoReinvestmentStop(address indexed customerAddress);
+
     /*=====================================
     =            CONFIGURABLES            =
     =====================================*/
@@ -107,50 +128,51 @@ contract Hourglass {
     uint256 internal constant tokenPriceInitial_ = 1000; // unit: sun
     uint256 internal constant tokenPriceIncremental_ = 100; // unit: sun
     uint256 internal constant magnitude = 2**64;
-    address public address_;
 
-    // requirement for earning a referral bonus (defaults at 1000 tokens)
-    uint256 public stakingRequirement = 1000e6;
+    // requirement for earning a referral bonus (defaults at 100 tokens)
+    uint256 public stakingRequirement = 100e6;
 
     // ambassador program
     mapping(address => bool) public ambassadors_;
-    uint256 internal constant ambassadorMaxPurchase_ = 400000e6; // In sun
-    uint256 internal constant ambassadorQuota_ = 100000e6; // In sun
+    uint256 internal constant ambassadorMaxPurchase_ = 40000e6; // 40k TRX
+    uint256 internal constant ambassadorQuota_ = 400000e6; // 400k TRX
 
     /*================================
     =            DATASETS            =
     ================================*/
-    // amount of shares for each address (scaled number)
+    // amount of tokens for each address (scaled number)
     mapping(address => uint256) internal tokenBalanceLedger_;
 
-    // mappings fro referral address
-
-    // amount of shares with their buy timestamp for each address
+    // amount of tokens bought with their buy timestamp for each address
     struct TimestampedBalance {
         uint256 value;
-        uint256 timestamp;
         uint256 valueSold;
+        uint40 timestamp;
     }
 
     mapping(address => TimestampedBalance[])
-        public tokenTimestampedBalanceLedger_;
+        internal tokenTimestampedBalanceLedger_;
 
+    // The start and end index of the unsold timestamped transactions list
     struct Cursor {
         uint256 start;
         uint256 end;
     }
 
+    mapping(address => Cursor) internal tokenTimestampedBalanceCursor;
+
+    // mappings to and from referral address
     mapping(address => bytes32) public referralMapping;
     mapping(bytes32 => address) public referralReverseMapping;
 
-    mapping(address => Cursor) internal tokenTimestampedBalanceCursor;
-
+    // The current referral balance
     mapping(address => uint256) public referralBalance_;
+    // All time referrals earnings
     mapping(address => uint256) public referralIncome_;
 
     mapping(address => int256) internal payoutsTo_;
     mapping(address => uint256) internal ambassadorAccumulatedQuota_;
-    uint256 internal tokenSupply_;
+    uint256 internal tokenSupply_ = 0;
     uint256 internal profitPerShare_;
 
     // administrator list (see above on what they can do)
@@ -166,19 +188,12 @@ contract Hourglass {
      * -- APPLICATION ENTRY POINTS --
      */
     constructor() public {
-        // add administrators here
-        administrators[
-            address(
-                0xdd8bb99b13fe33e1c32254dfb8fff3e71193f6b730a89dd33bfe5dedc6d83002
-            )
-        ] = true;
-
-        // check these lines
         address owner = msg.sender;
         administrators[owner] = true;
 
         // contributors that need to remain private out of security concerns.
-        ambassadors_[0xF5fCb8C1dB05645A0993a0be3e0f264551f5d75d] = true; //dp
+        // TODO: need to add ambassadors
+        // ambassadors_[0xF5fCb8C1dB05645A0993a0be3e0f264551f5d75d] = true; //dp
     }
 
     /**
@@ -204,31 +219,15 @@ contract Hourglass {
         uint24 period,
         uint256 rewardPerInvocation,
         uint256 minimumDividendValue
-    ) public onlyStronghands() {
-        // fetch dividends
-        uint256 _dividends = myDividends(false); // retrieve ref. bonus later in the code
-
-        // pay out the dividends virtually
-        address _customerAddress = msg.sender;
-        payoutsTo_[_customerAddress] += (int256)(_dividends * magnitude);
-
-        // retrieve ref. bonus
-        _dividends += referralBalance_[_customerAddress];
-        referralBalance_[_customerAddress] = 0;
-
-        // dispatch a buy order with the virtualized "withdrawn dividends"
-        uint256 _tokens =
-            purchaseTokens(_customerAddress, _dividends, address(0));
-
-        // fire event
-        emit onReinvestment(_customerAddress, _dividends, _tokens);
+    ) public {
+        _reinvest(msg.sender);
 
         // Setup Auto Reinvestment
-        if (isAutoReinvestChecked == true) {
-            setupAutoReinvest(
+        if (isAutoReinvestChecked) {
+            _setupAutoReinvest(
                 period,
                 rewardPerInvocation,
-                _customerAddress,
+                msg.sender,
                 minimumDividendValue
             );
         }
@@ -253,116 +252,6 @@ contract Hourglass {
     }
 
     /**
-     * Calculate the withholding penalty for selling x tokens
-     */
-    function calculateAveragePenalty(
-        uint256 _amountOfTokens,
-        address _customerAddress
-    ) public view onlyBagholders() returns (uint256) {
-        require(_amountOfTokens <= tokenBalanceLedger_[_customerAddress]);
-
-        uint256 sum = 0;
-        uint256 counter = tokenTimestampedBalanceCursor[_customerAddress].start;
-        uint256 averagePenalty = 0;
-
-        while (counter <= tokenTimestampedBalanceCursor[_customerAddress].end) {
-            TimestampedBalance storage transaction =
-                tokenTimestampedBalanceLedger_[_customerAddress][counter];
-            uint256 tokensAvailable =
-                SafeMath.sub(transaction.value, transaction.valueSold);
-
-            if (tokensAvailable < _amountOfTokens - sum) {
-                sum += tokensAvailable;
-                averagePenalty += SafeMath.mul(
-                    _calculatePenalty(transaction.timestamp),
-                    tokensAvailable
-                );
-            } else {
-                averagePenalty += SafeMath.mul(
-                    _calculatePenalty(transaction.timestamp),
-                    SafeMath.sub(_amountOfTokens, sum)
-                );
-                break;
-            }
-
-            counter += 1;
-        }
-
-        return SafeMath.div(averagePenalty, _amountOfTokens);
-    }
-
-    /**
-     * Calculate the withholding penalty for selling x tokens and edit the timestamped ledger
-     */
-    function executeAveragePenalty(
-        uint256 _amountOfTokens,
-        address customerAddress
-    ) public onlyBagholders() returns (uint256) {
-        // Parse through the list of transactions
-        uint256 sum = 0;
-        uint256 counter = tokenTimestampedBalanceCursor[customerAddress].start;
-        uint256 averagePenalty = 0;
-
-        while (counter <= tokenTimestampedBalanceCursor[customerAddress].end) {
-            uint256 tokensAvailable =
-                SafeMath.sub(
-                    tokenTimestampedBalanceLedger_[customerAddress][counter]
-                        .value,
-                    tokenTimestampedBalanceLedger_[customerAddress][counter]
-                        .valueSold
-                );
-
-            if (tokensAvailable < _amountOfTokens - sum) {
-                sum += tokensAvailable;
-                averagePenalty += SafeMath.mul(
-                    _calculatePenalty(
-                        tokenTimestampedBalanceLedger_[customerAddress][counter]
-                            .timestamp
-                    ),
-                    tokensAvailable
-                );
-                delete tokenTimestampedBalanceLedger_[customerAddress][counter];
-            } else {
-                averagePenalty += SafeMath.mul(
-                    _calculatePenalty(
-                        tokenTimestampedBalanceLedger_[customerAddress][counter]
-                            .timestamp
-                    ),
-                    SafeMath.sub(_amountOfTokens, sum)
-                );
-                tokenTimestampedBalanceLedger_[customerAddress][counter]
-                    .valueSold = SafeMath.sub(_amountOfTokens, sum);
-                tokenTimestampedBalanceCursor[customerAddress].start = counter;
-                break;
-            }
-
-            counter += 1;
-        }
-
-        return SafeMath.div(averagePenalty, _amountOfTokens);
-    }
-
-    /**
-     * Calculate the withholding penalty for selling x tokens
-     */
-    function _calculatePenalty(uint256 timestamp)
-        public
-        view
-        returns (uint256)
-    {
-        uint256 gap = block.timestamp - timestamp;
-
-        if (gap >= 2592000) {
-            return 0;
-        } else if (gap >= 1728001) {
-            return 25;
-        } else if (gap >= 864001) {
-            return 50;
-        }
-        return 75;
-    }
-
-    /**
      * Liquifies tokens to tron.
      */
     function sell(uint256 _amountOfTokens) public onlyBagholders() {
@@ -373,7 +262,7 @@ contract Hourglass {
         uint256 _tron = tokensToTron_(_tokens);
 
         uint256 penalty =
-            SafeMath.mulDiv(
+            mulDiv(
                 executeAveragePenalty(_amountOfTokens, _customerAddress),
                 _tron,
                 100
@@ -403,7 +292,7 @@ contract Hourglass {
             // update the amount of dividends per token
             profitPerShare_ = SafeMath.add(
                 profitPerShare_,
-                (_dividends * magnitude) / tokenSupply_
+                mulDiv(_dividends, magnitude, tokenSupply_)
             );
         }
 
@@ -425,10 +314,6 @@ contract Hourglass {
         administrators[_identifier] = _status;
     }
 
-    function getAddress_() public view returns (address) {
-        return address_;
-    }
-
     /**
      * Precautionary measures in case we need to adjust the masternode rate.
      */
@@ -439,14 +324,25 @@ contract Hourglass {
         stakingRequirement = _amountOfTokens;
     }
 
+    /**
+     * If we want to rebrand, we can.
+     */
+    function setName(string memory _name) public onlyAdministrator() {
+        name = _name;
+    }
+
+    /**
+     * If we want to rebrand, we can.
+     */
+    function setSymbol(string memory _symbol) public onlyAdministrator() {
+        symbol = _symbol;
+    }
+
     /*----------  REFERRAL FUNCTIONS  ----------*/
 
-    function setReferrals(address ref_address, bytes32 ref_name)
-        public
-        returns (bool)
-    {
-        referralMapping[ref_address] = ref_name;
-        referralReverseMapping[ref_name] = ref_address;
+    function setReferralName(bytes32 ref_name) public returns (bool) {
+        referralMapping[msg.sender] = ref_name;
+        referralReverseMapping[ref_name] = msg.sender;
         return true;
     }
 
@@ -478,10 +374,9 @@ contract Hourglass {
 
     function getCursor() public view returns (uint256, uint256) {
         address _customerAddress = msg.sender;
-        return (
-            tokenTimestampedBalanceCursor[_customerAddress].start,
-            tokenTimestampedBalanceCursor[_customerAddress].end
-        );
+        Cursor storage cursor = tokenTimestampedBalanceCursor[_customerAddress];
+
+        return (cursor.start, cursor.end);
     }
 
     function getTimestampedBalanceLedger(uint256 counter)
@@ -494,10 +389,12 @@ contract Hourglass {
         )
     {
         address _customerAddress = msg.sender;
+        TimestampedBalance storage transaction =
+            tokenTimestampedBalanceLedger_[_customerAddress][counter];
         return (
-            tokenTimestampedBalanceLedger_[_customerAddress][counter].value,
-            tokenTimestampedBalanceLedger_[_customerAddress][counter].timestamp,
-            tokenTimestampedBalanceLedger_[_customerAddress][counter].valueSold
+            transaction.value,
+            transaction.timestamp,
+            transaction.valueSold
         );
     }
 
@@ -573,7 +470,6 @@ contract Hourglass {
      * the user can use the `calculateTronReceived` to get the sell price specific to them
      */
     function sellPrice() public view returns (uint256) {
-        // our calculation relies on the token supply, so we need supply.
         if (tokenSupply_ == 0) {
             return tokenPriceInitial_ - tokenPriceIncremental_;
         } else {
@@ -592,15 +488,14 @@ contract Hourglass {
             return tokenPriceInitial_ + tokenPriceIncremental_;
         } else {
             uint256 _tron = tokensToTron_(1e6);
-
             uint256 _taxedTron =
-                SafeMath.mulDiv(_tron, dividendFee_, (dividendFee_ - 1));
+                mulDiv(_tron, dividendFee_, (dividendFee_ - 1));
             return _taxedTron;
         }
     }
 
     /*
-     * Function for the frontend to dynamically retrieve the price  scaling of buy orders.
+     * Function for the frontend to dynamically retrieve the price scaling of buy orders.
      */
     function calculateTokensReceived(uint256 _tronToSpend)
         public
@@ -614,10 +509,7 @@ contract Hourglass {
     }
 
     function calculateTokensReinvested() public view returns (uint256) {
-        uint256 _tronToSpend = myDividends(false);
-        address _customerAddress = msg.sender;
-        _tronToSpend += referralBalance_[_customerAddress];
-
+        uint256 _tronToSpend = myDividends(true);
         uint256 _dividends = SafeMath.div(_tronToSpend, dividendFee_);
         uint256 _taxedTron = SafeMath.sub(_tronToSpend, _dividends);
         uint256 _amountOfTokens = tronToTokens_(_taxedTron);
@@ -633,11 +525,12 @@ contract Hourglass {
         returns (uint256)
     {
         require(_tokensToSell <= tokenSupply_);
+        require(_tokensToSell <= myTokens());
         uint256 _tron = tokensToTron_(_tokensToSell);
         address _customerAddress = msg.sender;
 
         uint256 penalty =
-            SafeMath.mulDiv(
+            mulDiv(
                 calculateAveragePenalty(_tokensToSell, _customerAddress),
                 _tron,
                 100
@@ -659,12 +552,128 @@ contract Hourglass {
         returns (uint256)
     {
         require(_amountOfTokens <= tokenSupply_);
-
+        require(_amountOfTokens <= myTokens());
         uint256 _tokenFee = SafeMath.div(_amountOfTokens, dividendFee_);
-
         uint256 _taxedTokens = SafeMath.sub(_amountOfTokens, _tokenFee);
-
         return _taxedTokens;
+    }
+
+    /**
+     * Calculate the early exit penalty for selling x tokens
+     */
+    function calculateAveragePenalty(
+        uint256 _amountOfTokens,
+        address _customerAddress
+    ) public view onlyBagholders() returns (uint256) {
+        // TODO: write test cases for this function
+        require(_amountOfTokens <= tokenBalanceLedger_[_customerAddress]);
+
+        uint256 tokensFound = 0;
+        Cursor storage _customerCursor =
+            tokenTimestampedBalanceCursor[_customerAddress];
+        uint256 counter = _customerCursor.start;
+        uint256 averagePenalty = 0;
+
+        while (counter <= _customerCursor.end) {
+            TimestampedBalance storage transaction =
+                tokenTimestampedBalanceLedger_[_customerAddress][counter];
+            uint256 tokensAvailable =
+                SafeMath.sub(transaction.value, transaction.valueSold);
+
+            uint256 tokensRequired = SafeMath.sub(_amountOfTokens, tokensFound);
+
+            if (tokensAvailable < tokensRequired) {
+                tokensFound += tokensAvailable;
+                averagePenalty = SafeMath.add(
+                    averagePenalty,
+                    SafeMath.mul(
+                        _calculatePenalty(transaction.timestamp),
+                        tokensAvailable
+                    )
+                );
+            } else {
+                averagePenalty = SafeMath.add(
+                    averagePenalty,
+                    SafeMath.mul(
+                        _calculatePenalty(transaction.timestamp),
+                        tokensRequired
+                    )
+                );
+                break;
+            }
+
+            counter = SafeMath.add(counter, 1);
+        }
+        return SafeMath.div(averagePenalty, _amountOfTokens);
+    }
+
+    /**
+     * Calculate the early exit penalty for selling after x days
+     */
+    function _calculatePenalty(uint256 timestamp)
+        public
+        view
+        returns (uint256)
+    {
+        uint256 gap = block.timestamp - timestamp;
+
+        // TODO: check if the days unit works
+        if (gap > 30 days) {
+            return 0;
+        } else if (gap > 20 days) {
+            return 25;
+        } else if (gap > 10 days) {
+            return 50;
+        }
+        return 75;
+    }
+
+    /**
+     * Calculate Token price based on an amount of incoming tron
+     * Some conversions occurred to prevent decimal errors or underflows / overflows in solidity code.
+     */
+    function tronToTokens_(uint256 _tron) public view returns (uint256) {
+        uint256 _tokenPriceInitial = tokenPriceInitial_ * 1e6;
+        uint256 _tokensReceived =
+            ((
+                SafeMath.sub(
+                    (
+                        sqrt(
+                            (_tokenPriceInitial**2) +
+                                (2 *
+                                    (tokenPriceIncremental_ * 1e6) *
+                                    (_tron * 1e6)) +
+                                (((tokenPriceIncremental_)**2) *
+                                    (tokenSupply_**2)) +
+                                (2 *
+                                    (tokenPriceIncremental_) *
+                                    _tokenPriceInitial *
+                                    tokenSupply_)
+                        )
+                    ),
+                    _tokenPriceInitial
+                )
+            ) / (tokenPriceIncremental_)) - (tokenSupply_);
+
+        return _tokensReceived;
+    }
+
+    /**
+     * Calculate token sell value.
+     * Some conversions occurred to prevent decimal errors or underflows / overflows in solidity code.
+     */
+    function tokensToTron_(uint256 _tokens) public view returns (uint256) {
+        uint256 tokens_ = (_tokens + 1e6);
+        uint256 _tokenSupply = (tokenSupply_ + 1e6);
+        uint256 _tronReceived =
+            (SafeMath.sub(
+                (((tokenPriceInitial_ +
+                    (tokenPriceIncremental_ * (_tokenSupply / 1e6))) -
+                    tokenPriceIncremental_) * (tokens_ - 1e6)),
+                (tokenPriceIncremental_ * ((tokens_**2 - tokens_) / 1e6)) / 2
+            ) / 1e6);
+
+        return _tronReceived;
     }
 
     /*==========================================
@@ -755,6 +764,26 @@ contract Hourglass {
         return _amountOfTokens;
     }
 
+    function _reinvest(address _customerAddress) internal {
+        uint256 _dividends = dividendsOf(_customerAddress);
+
+        // onlyStronghands
+        require(_dividends + referralBalance_[_customerAddress] > 0);
+
+        payoutsTo_[_customerAddress] += (int256)(_dividends * magnitude);
+
+        // retrieve ref. bonus
+        _dividends += referralBalance_[_customerAddress];
+        referralBalance_[_customerAddress] = 0;
+
+        // dispatch a buy order with the virtualized "withdrawn dividends"
+        uint256 _tokens =
+            purchaseTokens(_customerAddress, _dividends, address(0));
+
+        // fire event
+        emit onReinvestment(_customerAddress, _dividends, _tokens);
+    }
+
     function _withdraw(address _customerAddress) internal {
         uint256 _dividends = dividendsOf(_customerAddress); // get ref. bonus later in the code
 
@@ -768,6 +797,7 @@ contract Hourglass {
         _dividends += referralBalance_[_customerAddress];
         referralBalance_[_customerAddress] = 0;
 
+        // TODO: remove transfer
         address payable _payableCustomerAddress =
             address(uint160(_customerAddress));
         _payableCustomerAddress.transfer(_dividends);
@@ -777,56 +807,96 @@ contract Hourglass {
     }
 
     /**
-     * Calculate Token price based on an amount of incoming tron
-     * Some conversions occurred to prevent decimal errors or underflows / overflows in solidity code.
+     * Update ledger after transferring x tokens
      */
-    function tronToTokens_(uint256 _tron) public view returns (uint256) {
-        uint256 _tokenPriceInitial = tokenPriceInitial_ * 1e6;
-        // uint256 _tokensReceived = _tron / tokenPriceInitial_; ///remove later
+    function _updateLedgerForTransfer(
+        uint256 _amountOfTokens,
+        address _customerAddress
+    ) internal {
+        // Parse through the list of transactions
+        // TODO: write test cases for this
+        uint256 tokensFound = 0;
 
-        //uncomment later
-        uint256 _tokensReceived =
-            ((
-                SafeMath.sub(
-                    (
-                        sqrt(
-                            (_tokenPriceInitial**2) +
-                                (2 *
-                                    (tokenPriceIncremental_ * 1e6) *
-                                    (_tron * 1e6)) +
-                                (((tokenPriceIncremental_)**2) *
-                                    (tokenSupply_**2)) +
-                                (2 *
-                                    (tokenPriceIncremental_) *
-                                    _tokenPriceInitial *
-                                    tokenSupply_)
-                        )
-                    ),
-                    _tokenPriceInitial
-                )
-            ) / (tokenPriceIncremental_)) - (tokenSupply_);
+        Cursor storage _customerCursor =
+            tokenTimestampedBalanceCursor[_customerAddress];
+        uint256 counter = _customerCursor.start;
 
-        return _tokensReceived;
+        while (counter <= _customerCursor.end) {
+            TimestampedBalance storage transaction =
+                tokenTimestampedBalanceLedger_[_customerAddress][counter];
+            uint256 tokensAvailable =
+                SafeMath.sub(transaction.value, transaction.valueSold);
+
+            uint256 tokensRequired = SafeMath.sub(_amountOfTokens, tokensFound);
+
+            if (tokensAvailable < tokensRequired) {
+                tokensFound += tokensAvailable;
+
+                delete tokenTimestampedBalanceLedger_[_customerAddress][
+                    counter
+                ];
+            } else {
+                transaction.valueSold += tokensRequired;
+                _customerCursor.start = counter;
+                break;
+            }
+            counter += 1;
+        }
     }
 
     /**
-     * Calculate token sell value.
-     * Some conversions occurred to prevent decimal errors or underflows / overflows in solidity code.
+     * Calculate the early exit penalty for selling x tokens and edit the timestamped ledger
      */
-    function tokensToTron_(uint256 _tokens) public view returns (uint256) {
-        uint256 tokens_ = (_tokens + 1e6);
-        uint256 _tokenSupply = (tokenSupply_ + 1e6);
-        uint256 _tronReceived =
-            (SafeMath.sub(
-                (((tokenPriceInitial_ +
-                    (tokenPriceIncremental_ * (_tokenSupply / 1e6))) -
-                    tokenPriceIncremental_) * (tokens_ - 1e6)),
-                (tokenPriceIncremental_ * ((tokens_**2 - tokens_) / 1e6)) / 2
-            ) / 1e6);
+    // TODO: find a better name for this function
+    function executeAveragePenalty(
+        uint256 _amountOfTokens,
+        address _customerAddress
+    ) internal onlyBagholders() returns (uint256) {
+        // Parse through the list of transactions
+        // TODO: write test cases for this
+        uint256 tokensFound = 0;
+        Cursor storage _customerCursor =
+            tokenTimestampedBalanceCursor[_customerAddress];
+        uint256 counter = _customerCursor.start;
+        uint256 averagePenalty = 0;
 
-        // uint256 _tronReceived = _tokens * tokenPriceInitial_; ///remove later
+        while (counter <= _customerCursor.end) {
+            TimestampedBalance storage transaction =
+                tokenTimestampedBalanceLedger_[_customerAddress][counter];
+            uint256 tokensAvailable =
+                SafeMath.sub(transaction.value, transaction.valueSold);
 
-        return _tronReceived;
+            uint256 tokensRequired = SafeMath.sub(_amountOfTokens, tokensFound);
+
+            if (tokensAvailable < tokensRequired) {
+                tokensFound += tokensAvailable;
+                averagePenalty = SafeMath.add(
+                    averagePenalty,
+                    SafeMath.mul(
+                        _calculatePenalty(transaction.timestamp),
+                        tokensAvailable
+                    )
+                );
+                delete tokenTimestampedBalanceLedger_[_customerAddress][
+                    counter
+                ];
+            } else {
+                averagePenalty = SafeMath.add(
+                    averagePenalty,
+                    SafeMath.mul(
+                        _calculatePenalty(transaction.timestamp),
+                        tokensRequired
+                    )
+                );
+                transaction.valueSold += tokensRequired;
+                _customerCursor.start = counter;
+                break;
+            }
+
+            counter += 1;
+        }
+
+        return SafeMath.div(averagePenalty, _amountOfTokens);
     }
 
     function sqrt(uint256 x) internal pure returns (uint256 y) {
@@ -836,6 +906,50 @@ contract Hourglass {
             y = z;
             z = (x / z + z) / 2;
         }
+    }
+
+    /**
+     * @dev calculates x*y and outputs a emulated 512bit number as l being the lower 256bit half and h the upper 256bit half.
+     */
+    function fullMul(uint256 x, uint256 y)
+        public
+        pure
+        returns (uint256 l, uint256 h)
+    {
+        uint256 mm = mulmod(x, y, uint256(-1));
+        l = x * y;
+        h = mm - l;
+        if (mm < l) h -= 1;
+    }
+
+    // TODO: Test this with very large and small numbers
+    /**
+     * @dev calculates x*y/z taking care of phantom overflows.
+     */
+    function mulDiv(
+        uint256 x,
+        uint256 y,
+        uint256 z
+    ) public pure returns (uint256) {
+        (uint256 l, uint256 h) = fullMul(x, y);
+        require(h < z);
+        uint256 mm = mulmod(x, y, z);
+        if (mm > l) h -= 1;
+        l -= mm;
+        uint256 pow2 = z & -z;
+        z /= pow2;
+        l /= pow2;
+        l += h * ((-pow2) / pow2 + 1);
+        uint256 r = 1;
+        r *= 2 - z * r;
+        r *= 2 - z * r;
+        r *= 2 - z * r;
+        r *= 2 - z * r;
+        r *= 2 - z * r;
+        r *= 2 - z * r;
+        r *= 2 - z * r;
+        r *= 2 - z * r;
+        return l * r;
     }
 
     /*
@@ -849,38 +963,37 @@ contract Hourglass {
     struct AutoReinvestEntry {
         uint256 nextExecutionTime;
         uint256 rewardPerInvocation;
-        uint24 period;
         uint256 minimumDividendValue;
+        uint24 period;
     }
-
-    // Event for when a user sets up AutoReinvestment
-    event onAutoReinvestmentEntry(
-        address indexed customerAddress,
-        uint256 nextExecutionTime,
-        uint256 rewardPerInvocation,
-        uint24 period,
-        uint256 minimumDividendValue
-    );
-
-    // Event for when a user stops AutoReinvestment
-    event onAutoReinvestmentStop(address indexed customerAddress);
 
     mapping(address => AutoReinvestEntry) internal autoReinvestment;
 
     function setupAutoReinvest(
         uint24 period,
         uint256 rewardPerInvocation,
+        uint256 minimumDividendValue
+    ) public {
+        _setupAutoReinvest(
+            period,
+            rewardPerInvocation,
+            msg.sender,
+            minimumDividendValue
+        );
+    }
+
+    function _setupAutoReinvest(
+        uint24 period,
+        uint256 rewardPerInvocation,
         address customerAddress,
         uint256 minimumDividendValue
     ) internal {
-        autoReinvestment[customerAddress].nextExecutionTime =
-            block.timestamp +
-            period;
-        autoReinvestment[customerAddress].period = period;
-        autoReinvestment[customerAddress]
-            .rewardPerInvocation = rewardPerInvocation;
-        autoReinvestment[customerAddress]
-            .minimumDividendValue = minimumDividendValue;
+        autoReinvestment[customerAddress] = AutoReinvestEntry(
+            block.timestamp + period,
+            rewardPerInvocation,
+            minimumDividendValue,
+            period
+        );
 
         // Launch an event that this entry has been created
         emit onAutoReinvestmentEntry(
@@ -897,39 +1010,34 @@ contract Hourglass {
         external
         returns (uint256)
     {
+        AutoReinvestEntry storage entry = autoReinvestment[_customerAddress];
+
         if (
-            autoReinvestment[_customerAddress].nextExecutionTime > 0 &&
-            block.timestamp >=
-            autoReinvestment[_customerAddress].nextExecutionTime
+            entry.nextExecutionTime > 0 &&
+            block.timestamp >= entry.nextExecutionTime
         ) {
             // fetch dividends
-            uint256 _dividends = dividendsOf(_customerAddress);
+            uint256 _dividends =
+                dividendsOf(_customerAddress) +
+                    referralBalance_[_customerAddress];
 
-            // Only execute if the user's dividends are more that the rewardPerInvocation
+            // Only execute if the user's dividends are more that the
+            // rewardPerInvocation and the minimumDividendValue
             if (
-                _dividends >
-                autoReinvestment[_customerAddress].minimumDividendValue &&
-                _dividends >
-                autoReinvestment[_customerAddress].rewardPerInvocation
+                _dividends > entry.minimumDividendValue &&
+                _dividends > entry.rewardPerInvocation
             ) {
                 // Deduct the reward from the users dividends
                 payoutsTo_[_customerAddress] += (int256)(
-                    autoReinvestment[_customerAddress].rewardPerInvocation *
-                        magnitude
-                );
-
-                // Send the caller their reward
-                msg.sender.transfer(
-                    autoReinvestment[_customerAddress].rewardPerInvocation
+                    entry.rewardPerInvocation * magnitude
                 );
 
                 // Update the Auto Reinvestment entry
-                autoReinvestment[_customerAddress].nextExecutionTime +=
-                    (((block.timestamp -
-                        autoReinvestment[_customerAddress].nextExecutionTime) /
-                        uint256(autoReinvestment[_customerAddress].period)) +
-                        1) *
-                    uint256(autoReinvestment[_customerAddress].period);
+                // TODO: Test this equation
+                entry.nextExecutionTime +=
+                    (((block.timestamp - entry.nextExecutionTime) /
+                        uint256(entry.period)) + 1) *
+                    uint256(entry.period);
 
                 /*
                  * Do the reinvestment
@@ -952,10 +1060,14 @@ contract Hourglass {
 
                 // fire event
                 emit onReinvestment(_customerAddress, _dividends, _tokens);
+
+                // Send the caller their reward
+                // TODO: use call here, look at the SWC example
+                msg.sender.transfer(entry.rewardPerInvocation);
             }
         }
 
-        return autoReinvestment[_customerAddress].nextExecutionTime;
+        return entry.nextExecutionTime;
     }
 
     // Read function for the frontend to determine if the user has setup Auto Reinvestment or not
@@ -1013,11 +1125,6 @@ contract Hourglass {
     }
 
     // Allowance, Approval and Transfer From
-    event Approval(
-        address indexed owner,
-        address indexed spender,
-        uint256 value
-    );
 
     mapping(address => mapping(address => uint256)) private _allowances;
 
@@ -1047,8 +1154,17 @@ contract Hourglass {
         return true;
     }
 
+    function transfer(address _toAddress, uint256 _amountOfTokens)
+        public
+        onlyBagholders
+        returns (bool)
+    {
+        _transfer(msg.sender, _toAddress, _amountOfTokens);
+        return true;
+    }
+
     /**
-     * @dev Moves tokens `amount` from `sender` to `recipient`.
+     * @dev Moves tokens `amount` from `sender` to `recipient` after liquifying 10% of the tokens `amount` as dividens.
      *
      * This is internal function is equivalent to {transfer}, and can be used to
      * e.g. implement automatic token fees, slashing mechanisms, etc.
@@ -1075,10 +1191,13 @@ contract Hourglass {
             "TRC20: transfer to the zero address"
         );
 
-        // make sure we have the requested tokens
         // also disables transfers until ambassador phase is over
         // ( we dont want whale premines )
-        require(_amountOfTokens <= tokenBalanceLedger_[_customerAddress]);
+        // make sure we have the requested tokens
+        require(
+            !onlyAmbassadors &&
+                _amountOfTokens <= tokenBalanceLedger_[_customerAddress]
+        );
 
         // withdraw all outstanding dividends first
         if (
@@ -1088,9 +1207,11 @@ contract Hourglass {
             _withdraw(_customerAddress);
         }
 
-        // apply the early exit penalty on the tokens and then liquify 10% of the remaining tokens that are transfered
-        // these are dispersed to shareholders
+        // updating tokenTimestampedBalanceLedger_ for _customerAddress
+        _updateLedgerForTransfer(_amountOfTokens, _customerAddress);
 
+        // liquify 10% of the remaining tokens that are transfered
+        // these are dispersed to shareholders
         uint256 _tokenFee = SafeMath.div(_amountOfTokens, dividendFee_);
 
         uint256 _taxedTokens = SafeMath.sub(_amountOfTokens, _tokenFee);
@@ -1109,6 +1230,12 @@ contract Hourglass {
             _taxedTokens
         );
 
+        // updating tokenTimestampedBalanceLedger_ for _toAddress
+        tokenTimestampedBalanceLedger_[_toAddress].push(
+            TimestampedBalance(_taxedTokens, block.timestamp, 0)
+        );
+        tokenTimestampedBalanceCursor[_toAddress].end += 1;
+
         // update dividend trackers
         payoutsTo_[_customerAddress] -= (int256)(
             profitPerShare_ * _amountOfTokens
@@ -1118,25 +1245,11 @@ contract Hourglass {
         // disperse dividends among holders
         profitPerShare_ = SafeMath.add(
             profitPerShare_,
-            SafeMath.mulDiv(_dividends, magnitude, tokenSupply_)
+            mulDiv(_dividends, magnitude, tokenSupply_)
         );
 
         // fire event
         emit Transfer(_customerAddress, _toAddress, _taxedTokens);
-    }
-
-    function transfer(address _toAddress, uint256 _amountOfTokens)
-        public
-        onlyBagholders
-        returns (bool)
-    {
-        // setup
-        address _customerAddress = msg.sender;
-
-        _transfer(_customerAddress, _toAddress, _amountOfTokens);
-
-        // TRC20
-        return true;
     }
 
     /**
@@ -1207,8 +1320,52 @@ contract Hourglass {
     ) internal {
         require(owner != address(0), "TRC20: approve from the zero address");
         require(spender != address(0), "TRC20: approve to the zero address");
-
         _allowances[owner][spender] = value;
         emit Approval(owner, spender, value);
+    }
+}
+
+/**
+ * @title SafeMath
+ * @dev Math operations with safety checks that throw on error
+ */
+library SafeMath {
+    /**
+     * @dev Multiplies two numbers, throws on overflow.
+     */
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) {
+            return 0;
+        }
+        uint256 c = a * b;
+        assert(c / a == b);
+        return c;
+    }
+
+    /**
+     * @dev Integer division of two numbers, truncating the quotient.
+     */
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        // assert(b > 0); // Solidity automatically throws when dividing by 0
+        uint256 c = a / b;
+        // assert(a == b * c + a % b); // There is no case in which this doesn't hold
+        return c;
+    }
+
+    /**
+     * @dev Substracts two numbers, throws on overflow (i.e. if subtrahend is greater than minuend).
+     */
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        assert(b <= a);
+        return a - b;
+    }
+
+    /**
+     * @dev Adds two numbers, throws on overflow.
+     */
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        assert(c >= a);
+        return c;
     }
 }
